@@ -2,7 +2,32 @@ import { randomUUID } from 'crypto';
 import { Redis } from '@upstash/redis';
 import { homedir } from 'os';
 import { join } from 'path';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { createId } from '@paralleldrive/cuid2';
 import { envVars } from './envVars';
+
+// API Keys handling
+const API_KEYS_FILE = join(import.meta.dir, 'api-keys.json');
+
+function loadOrGenerateApiKeys(): string[] {
+  if (existsSync(API_KEYS_FILE)) {
+      const content = readFileSync(API_KEYS_FILE, 'utf-8');
+      const keys = JSON.parse(content);
+      if (Array.isArray(keys) && keys.every(k => typeof k === 'string')) {
+        return keys;
+      }
+      console.warn('Invalid format in api-keys.json, regenerating...');
+  }
+  
+  const newKey = createId();
+  console.log('Generated new API key:', newKey);
+  const keys = [newKey];
+  writeFileSync(API_KEYS_FILE, JSON.stringify(keys, null, 2));
+  return keys;
+}
+
+const validApiKeys = new Set(loadOrGenerateApiKeys());
+console.log('Loaded API Keys:', [...validApiKeys]);
 
 // Assume you have set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in your environment variables.
 // Ensure that on the host machine, you have interactively logged in to the Claude and Codex CLIs,
@@ -13,6 +38,13 @@ import { envVars } from './envVars';
 Bun.serve({
   port: envVars.PORT,
   async fetch(req: Request) {
+    const authHeader = req.headers.get('Authorization');
+    const token = authHeader?.replace('Bearer ', '').trim();
+
+    if (!token || !validApiKeys.has(token)) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     const url = new URL(req.url);
     const modelMatch = url.pathname.match(/^\/model\/([^/]+)\/?$/);
     const modelName = modelMatch ? modelMatch[1] : null;

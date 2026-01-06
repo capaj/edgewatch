@@ -13,6 +13,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@paralleldrive/cuid2": "^3.0.6",
     "@upstash/redis": "^1.36.0",
     "zod": "^4.3.5"
   }

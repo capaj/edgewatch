@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     nodejs \
     npm \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude CLI
@@ -28,6 +29,11 @@ ENV PATH="$PNPM_HOME:$PATH"
 
 # Install Codex CLI globally via pnpm
 RUN pnpm add -g @openai/codex
+
+# Install Bun
+ENV BUN_INSTALL="/root/.bun"
+ENV PATH="$BUN_INSTALL/bin:$PATH"
+RUN curl -fsSL https://bun.sh/install | bash
 
 # Create a config directory structure if separate from home
 RUN mkdir -p /root/.claude /root/.codex
