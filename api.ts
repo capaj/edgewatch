@@ -114,6 +114,7 @@ async function processPrompt(
   const hostHome = homedir();
   const claudeMount = join(hostHome, '.claude') + ':/root/.claude';
   const codexMount = join(hostHome, '.codex') + ':/root/.codex';
+  const ghMount = join(hostHome, '.config', 'gh') + ':/root/.config/gh';
 
   const proc = Bun.spawn(
     [
@@ -126,6 +127,8 @@ async function processPrompt(
       claudeMount,
       '-v',
       codexMount,
+      '-v',
+      ghMount,
       'edgewatch-agent',
       'bash',
       '-c',
