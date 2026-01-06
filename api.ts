@@ -41,16 +41,27 @@ Bun.serve({
   port: envVars.PORT,
   async fetch(req: Request) {
     const authHeader = req.headers.get('Authorization');
+    const url = new URL(req.url);
+    
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     const token = authHeader?.replace('Bearer ', '').trim();
 
     if (!token || !validApiKeys.has(token)) {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    const url = new URL(req.url);
     const modelMatch = url.pathname.match(/^\/model\/([^/]+)\/?$/);
     const modelName = modelMatch ? modelMatch[1] : null;
     const isModelRequest = modelName !== null && req.method === 'POST';
+
+
 
     if ((url.pathname === '/run-prompt' && req.method === 'POST') || isModelRequest) {
       const bodySchema = z.object({
