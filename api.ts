@@ -5,6 +5,8 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { createId } from '@paralleldrive/cuid2';
 import { envVars } from './envVars';
+import slugify from '@sindresorhus/slugify';
+import { z } from 'zod';
 
 // API Keys handling
 const API_KEYS_FILE = join(import.meta.dir, 'api-keys.json');
@@ -51,12 +53,18 @@ Bun.serve({
     const isModelRequest = modelName !== null && req.method === 'POST';
 
     if ((url.pathname === '/run-prompt' && req.method === 'POST') || isModelRequest) {
-      const body = await req.json();
-      const { prompt, repo } = body as { prompt: string; repo: string };
+      const bodySchema = z.object({
+        prompt: z.string(),
+        repo: z.string(),
+        branch: z.string().optional(),
+      });
+      const result = bodySchema.safeParse(await req.json());
 
-      if (!prompt || !repo) {
-        return new Response(JSON.stringify({ error: 'Missing prompt or repo in payload' }), { status: 400 });
+      if (!result.success) {
+        return new Response(JSON.stringify({ error: result.error.format() }), { status: 400 });
       }
+
+      const { prompt, repo, branch } = result.data;
 
       let selectedModel: 'claude' | 'codex' | 'both' = 'both';
       if (isModelRequest) {
@@ -71,7 +79,8 @@ Bun.serve({
       const promptId = randomUUID();
 
       // Start background processing
-      processPrompt(prompt, repo, promptId, selectedModel).catch(console.error);
+      // Start background processing
+      processPrompt(prompt, repo, promptId, selectedModel, branch).catch(console.error);
 
       return new Response(JSON.stringify({ promptId }), {
         headers: { 'Content-Type': 'application/json' },
@@ -87,7 +96,8 @@ async function processPrompt(
   prompt: string,
   repo: string,
   promptId: string,
-  selectedModel: 'claude' | 'codex' | 'both'
+  selectedModel: 'claude' | 'codex' | 'both',
+  branch?: string
 ) {
   // Escape prompt for shell
   const escapedPrompt = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$');
@@ -98,15 +108,38 @@ async function processPrompt(
 
   const commandParts: string[] = [];
 
-  // Clone repo
-  commandParts.push(`git clone "${escapedRepo}" /tmp/repo`, 'cd /tmp/repo');
+  const escapedBranch = branch ? branch.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$') : undefined;
+
+  const repoSlug = slugify(repo);
+  // Clone repo or pull if exists
+  commandParts.push(
+    `if [ ! -d "/tmp/edgewatch/${repoSlug}" ]; then git clone "${escapedRepo}" "/tmp/edgewatch/${repoSlug}"; fi`,
+    `cd "/tmp/edgewatch/${repoSlug}"`,
+    `git fetch`,
+    `git checkout ${escapedBranch ? `"${escapedBranch}"` : `$(git symbolic-ref refs/remotes/origin/HEAD | sed 's|^refs/remotes/origin/||')`}`,
+    `git pull`
+  );
+
+  const parallelCmds: string[] = [];
 
   if (needsClaude) {
-    commandParts.push('echo "CLAUDE_START"', `claude --dangerously-skip-permissions -p "${escapedPrompt}"`, 'echo "CLAUDE_END"');
+    parallelCmds.push(`(claude --dangerously-skip-permissions -p "${escapedPrompt}" > /tmp/edgewatch/${promptId}_claude.out 2>&1)`);
   }
 
   if (needsCodex) {
-    commandParts.push('echo "CODEX_START"', `codex exec --yolo "${escapedPrompt}"`, 'echo "CODEX_END"');
+    parallelCmds.push(`(codex exec --yolo "${escapedPrompt}" > /tmp/edgewatch/${promptId}_codex.out 2>&1)`);
+  }
+
+  if (parallelCmds.length > 0) {
+    commandParts.push(parallelCmds.join(' & ') + ' & wait');
+  }
+
+  if (needsClaude) {
+    commandParts.push('echo "CLAUDE_START"', `cat /tmp/edgewatch/${promptId}_claude.out || true`, 'echo "CLAUDE_END"');
+  }
+
+  if (needsCodex) {
+    commandParts.push('echo "CODEX_START"', `cat /tmp/edgewatch/${promptId}_codex.out || true`, 'echo "CODEX_END"');
   }
 
   const commands = commandParts.join(' && \\\n');
