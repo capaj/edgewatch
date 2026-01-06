@@ -4,7 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun api.ts"
+    "dev": "bun api.ts",
+    "start": "bun api.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -16,6 +17,7 @@
     "@paralleldrive/cuid2": "^3.0.6",
     "@sindresorhus/slugify": "^3.0.0",
     "@upstash/redis": "^1.36.0",
+    "pm2": "^6.0.14",
     "zod": "^4.3.5"
   }
 }
