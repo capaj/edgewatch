@@ -1,6 +1,8 @@
 # EdgeWatch Agent
 
-A secure, Docker-based agent for running AI coding assistants (Claude and Codex) on untrusted codebases. This agent facilitates creating a sandbox environment where AI tools can safely interact with repositories without exposing the host system to potential risks.
+A Docker-based agent for running AI coding assistants (Claude and Codex) on untrusted codebases. This agent facilitates creating a sandbox environment where AI tools can safely interact with repositories without exposing the host system to potential risks.
+
+Think of this as a Claude code web or Codex web self-hosted alternative. It's an api for running Claude and Codex commands on any git hosted codebase. 
 
 ## Features
 
