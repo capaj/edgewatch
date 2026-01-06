@@ -141,6 +141,7 @@ async function processPrompt(
   const claudeMount = join(hostHome, '.claude') + ':/root/.claude';
   const codexMount = join(hostHome, '.codex') + ':/root/.codex';
   const ghMount = join(hostHome, '.config', 'gh') + ':/root/.config/gh';
+  const sshMount = join(hostHome, '.ssh') + ':/root/.ssh';
 
   const proc = Bun.spawn(
     [
@@ -155,6 +156,8 @@ async function processPrompt(
       codexMount,
       '-v',
       ghMount,
+      '-v',
+      sshMount,
       'edgewatch-agent',
       'bash',
       '-c',
