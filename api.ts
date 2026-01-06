@@ -1,0 +1,183 @@
+import { randomUUID } from 'crypto';
+import { Redis } from '@upstash/redis';
+import { homedir } from 'os';
+import { join } from 'path';
+import { envVars } from './envVars';
+
+// Assume you have set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in your environment variables.
+// Ensure that on the host machine, you have interactively logged in to the Claude and Codex CLIs,
+// so that credential files exist at ~/.claude/credentials.json and ~/.codex/auth.json (or relevant config directories).
+// These will be mounted into the Docker container.
+// Do NOT set ANTHROPIC_API_KEY or OPENAI_API_KEY in the environment, as we want to use subscription credentials.
+
+Bun.serve({
+  port: envVars.PORT,
+  async fetch(req: Request) {
+    const url = new URL(req.url);
+    const modelMatch = url.pathname.match(/^\/model\/([^/]+)\/?$/);
+    const modelName = modelMatch ? modelMatch[1] : null;
+    const isModelRequest = modelName !== null && req.method === 'POST';
+
+    if ((url.pathname === '/run-prompt' && req.method === 'POST') || isModelRequest) {
+      const body = await req.json();
+      const { prompt, repo } = body as { prompt: string; repo: string };
+
+      if (!prompt || !repo) {
+        return new Response(JSON.stringify({ error: 'Missing prompt or repo in payload' }), { status: 400 });
+      }
+
+      let selectedModel: 'claude' | 'codex' | 'both' = 'both';
+      if (isModelRequest) {
+        if (modelName !== 'claude' && modelName !== 'codex') {
+          return new Response(JSON.stringify({ error: 'Invalid model. Use "claude" or "codex".' }), {
+            status: 400,
+          });
+        }
+        selectedModel = modelName;
+      }
+
+      const promptId = randomUUID();
+
+      // Start background processing
+      processPrompt(prompt, repo, promptId, selectedModel).catch(console.error);
+
+      return new Response(JSON.stringify({ promptId }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response('Not Found', { status: 404 });
+  },
+});
+
+console.log(`Server running on http://localhost:${envVars.PORT}`);
+
+async function processPrompt(
+  prompt: string,
+  repo: string,
+  promptId: string,
+  selectedModel: 'claude' | 'codex' | 'both'
+) {
+  // Escape prompt for shell
+  const escapedPrompt = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$');
+  const escapedRepo = repo.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$');
+
+  const needsClaude = selectedModel === 'claude' || selectedModel === 'both';
+  const needsCodex = selectedModel === 'codex' || selectedModel === 'both';
+
+  const commandParts: string[] = [];
+
+  // Clone repo
+  commandParts.push(`git clone "${escapedRepo}" /tmp/repo`, 'cd /tmp/repo');
+
+  if (needsClaude) {
+    commandParts.push('echo "CLAUDE_START"', `claude --dangerously-skip-permissions -p "${escapedPrompt}"`, 'echo "CLAUDE_END"');
+  }
+
+  if (needsCodex) {
+    commandParts.push('echo "CODEX_START"', `codex exec --yolo "${escapedPrompt}"`, 'echo "CODEX_END"');
+  }
+
+  const commands = commandParts.join(' && \\\n');
+
+  const hostHome = homedir();
+  const claudeMount = join(hostHome, '.claude') + ':/root/.claude';
+  const codexMount = join(hostHome, '.codex') + ':/root/.codex';
+
+  const proc = Bun.spawn(
+    [
+      'docker',
+      'run',
+      '--rm',
+      '-m',
+      '4g',
+      '-v',
+      claudeMount,
+      '-v',
+      codexMount,
+      'edgewatch-agent',
+      'bash',
+      '-c',
+      commands,
+    ],
+    {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    }
+  );
+
+  let fullOutput = '';
+  let stderrOutput = '';
+
+  async function readStream(
+    stream: ReadableStream<Uint8Array>,
+    writeTo: 'stdout' | 'stderr',
+    onChunk: (text: string) => void
+  ): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      const text = decoder.decode(value, { stream: true });
+      if (writeTo === 'stdout') {
+        process.stdout.write(text);
+      } else {
+        process.stderr.write(text);
+      }
+      onChunk(text);
+    }
+    
+    // Flush any remaining characters
+    const text = decoder.decode();
+    if (text) {
+      if (writeTo === 'stdout') {
+        process.stdout.write(text);
+      } else {
+        process.stderr.write(text);
+      }
+      onChunk(text);
+    }
+  }
+
+  await Promise.all([
+    readStream(proc.stdout, 'stdout', (text) => {
+      fullOutput += text;
+    }),
+    readStream(proc.stderr, 'stderr', (text) => {
+      stderrOutput += text;
+    }),
+  ]);
+
+  await proc.exited;
+
+  if (proc.exitCode !== 0) {
+    console.log(`Docker process exited with code ${proc.exitCode}`);
+    // Output has already been streamed to the console
+    return;
+  }
+
+  // Parse outputs
+  const claudeMatch = fullOutput.match(/CLAUDE_START([\s\S]*?)CLAUDE_END/);
+  const codexMatch = fullOutput.match(/CODEX_START([\s\S]*?)CODEX_END/);
+
+  const claudeOutput = claudeMatch ? claudeMatch[1]?.trim() : '';
+  const codexOutput = codexMatch ? codexMatch[1]?.trim() : '';
+
+  const outputPayload = {
+    claude: claudeOutput,
+    codex: codexOutput,
+    createdAt: new Date().toISOString(),
+  };
+
+  // Write to Upstash Redis
+  const redis = new Redis({
+    url: envVars.UPSTASH_REDIS_REST_URL,
+    token: envVars.UPSTASH_REDIS_REST_TOKEN,
+  });
+
+  await redis.set(promptId, JSON.stringify(outputPayload));
+
+  console.log(`Processed prompt ${promptId}`);
+}

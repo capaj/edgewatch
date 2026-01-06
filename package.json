@@ -1,0 +1,19 @@
+{
+  "name": "edgewatch-agent",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun api.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.36.0",
+    "zod": "^4.3.5"
+  }
+}
