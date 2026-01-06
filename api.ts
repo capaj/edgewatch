@@ -92,6 +92,7 @@ Bun.serve({
 
 console.log(`Server running on http://localhost:${envVars.PORT}`);
 
+const REDIS_WRITE_THROTTLE_TIME = 1000;
 async function processPrompt(
   prompt: string,
   repo: string,
@@ -123,23 +124,15 @@ async function processPrompt(
   const parallelCmds: string[] = [];
 
   if (needsClaude) {
-    parallelCmds.push(`(claude --dangerously-skip-permissions -p "${escapedPrompt}" > /tmp/edgewatch/${promptId}_claude.out 2>&1)`);
+    parallelCmds.push(`(claude --dangerously-skip-permissions -p "${escapedPrompt}" 2>&1 | sed -u 's/^/CLAUDE_CHUNK: /')`);
   }
 
   if (needsCodex) {
-    parallelCmds.push(`(codex exec --yolo "${escapedPrompt}" > /tmp/edgewatch/${promptId}_codex.out 2>&1)`);
+    parallelCmds.push(`(codex exec --yolo "${escapedPrompt}" 2>&1 | sed -u 's/^/CODEX_CHUNK: /')`);
   }
 
   if (parallelCmds.length > 0) {
     commandParts.push(parallelCmds.join(' & ') + ' & wait');
-  }
-
-  if (needsClaude) {
-    commandParts.push('echo "CLAUDE_START"', `cat /tmp/edgewatch/${promptId}_claude.out || true`, 'echo "CLAUDE_END"');
-  }
-
-  if (needsCodex) {
-    commandParts.push('echo "CODEX_START"', `cat /tmp/edgewatch/${promptId}_codex.out || true`, 'echo "CODEX_END"');
   }
 
   const commands = commandParts.join(' && \\\n');
@@ -173,8 +166,32 @@ async function processPrompt(
     }
   );
 
-  let fullOutput = '';
-  let stderrOutput = '';
+  let claudeOutput = '';
+  let codexOutput = '';
+
+  // Write to Upstash Redis
+  const redis = new Redis({
+    url: envVars.UPSTASH_REDIS_REST_URL,
+    token: envVars.UPSTASH_REDIS_REST_TOKEN,
+  });
+
+  let lastRedisUpdate = 0;
+  const updatePayload = async () => {
+    const payload = {
+      claude: claudeOutput.trim(),
+      codex: codexOutput.trim(),
+      createdAt: new Date().toISOString(),
+    };
+    await redis.set(promptId, JSON.stringify(payload));
+  };
+
+  const throttledUpdate = () => {
+    const now = Date.now();
+    if (now - lastRedisUpdate > REDIS_WRITE_THROTTLE_TIME) {
+      lastRedisUpdate = now;
+      updatePayload().catch(console.error);
+    }
+  };
 
   async function readStream(
     stream: ReadableStream<Uint8Array>,
@@ -183,69 +200,74 @@ async function processPrompt(
   ): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
     
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       
       const text = decoder.decode(value, { stream: true });
-      if (writeTo === 'stdout') {
-        process.stdout.write(text);
-      } else {
-        process.stderr.write(text);
+      buffer += text;
+      
+      let lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (writeTo === 'stdout') {
+             if (line.startsWith('CLAUDE_CHUNK: ')) {
+               const content = line.substring('CLAUDE_CHUNK: '.length);
+               claudeOutput += content + '\n';
+               process.stdout.write(line + '\n'); // Keep logging raw or clean? Keeping raw for debugging
+               throttledUpdate();
+             } else if (line.startsWith('CODEX_CHUNK: ')) {
+               const content = line.substring('CODEX_CHUNK: '.length);
+               codexOutput += content + '\n';
+               process.stdout.write(line + '\n');
+               throttledUpdate();
+             } else {
+               process.stdout.write(line + '\n');
+             }
+        } else {
+             process.stderr.write(line + '\n');
+        }
       }
       onChunk(text);
     }
     
     // Flush any remaining characters
     const text = decoder.decode();
-    if (text) {
-      if (writeTo === 'stdout') {
-        process.stdout.write(text);
-      } else {
-        process.stderr.write(text);
-      }
-      onChunk(text);
+    if (text || buffer) {
+       const finalChunk = text ? buffer + text : buffer;
+       if (finalChunk) {
+           if (writeTo === 'stdout') {
+                // Simplified handling for final chunk without newline
+                if (finalChunk.startsWith('CLAUDE_CHUNK: ')) {
+                    claudeOutput += finalChunk.substring('CLAUDE_CHUNK: '.length);
+                } else if (finalChunk.startsWith('CODEX_CHUNK: ')) {
+                    codexOutput += finalChunk.substring('CODEX_CHUNK: '.length);
+                }
+                process.stdout.write(finalChunk);
+           } else {
+                process.stderr.write(finalChunk);
+           }
+           onChunk(finalChunk);
+       }
     }
   }
 
   await Promise.all([
-    readStream(proc.stdout, 'stdout', (text) => {
-      fullOutput += text;
-    }),
-    readStream(proc.stderr, 'stderr', (text) => {
-      stderrOutput += text;
-    }),
+    readStream(proc.stdout, 'stdout', () => {}),
+    readStream(proc.stderr, 'stderr', () => {}),
   ]);
 
   await proc.exited;
 
+  // Final update to ensure everything is synced
+  await updatePayload();
+
   if (proc.exitCode !== 0) {
     console.log(`Docker process exited with code ${proc.exitCode}`);
-    // Output has already been streamed to the console
-    return;
   }
-
-  // Parse outputs
-  const claudeMatch = fullOutput.match(/CLAUDE_START([\s\S]*?)CLAUDE_END/);
-  const codexMatch = fullOutput.match(/CODEX_START([\s\S]*?)CODEX_END/);
-
-  const claudeOutput = claudeMatch ? claudeMatch[1]?.trim() : '';
-  const codexOutput = codexMatch ? codexMatch[1]?.trim() : '';
-
-  const outputPayload = {
-    claude: claudeOutput,
-    codex: codexOutput,
-    createdAt: new Date().toISOString(),
-  };
-
-  // Write to Upstash Redis
-  const redis = new Redis({
-    url: envVars.UPSTASH_REDIS_REST_URL,
-    token: envVars.UPSTASH_REDIS_REST_TOKEN,
-  });
-
-  await redis.set(promptId, JSON.stringify(outputPayload));
 
   console.log(`Processed prompt ${promptId}`);
 }
